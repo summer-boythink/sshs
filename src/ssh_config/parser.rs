@@ -12,6 +12,8 @@ use super::parser_error::ParseError;
 use super::parser_error::UnknownEntryError;
 use super::{EntryType, Host};
 
+const MAX_INCLUDE_DEPTH: usize = 16;
+
 #[derive(Debug)]
 pub struct Parser {
     ignore_unknown_entries: bool,
@@ -38,15 +40,31 @@ impl Parser {
     where
         P: AsRef<Path>,
     {
+        // OpenSSH resolves relative Include paths against /etc/ssh for the
+        // system configuration file, and against ~/.ssh otherwise.
+        let include_base = if path.as_ref().starts_with("/etc/ssh") {
+            "/etc/ssh".to_string()
+        } else {
+            shellexpand::tilde("~/.ssh").to_string()
+        };
+
         let mut reader = BufReader::new(File::open(path)?);
-        self.parse(&mut reader)
+        self.parse_with_base(&mut reader, &include_base)
     }
 
     /// # Errors
     ///
     /// Will return `Err` if the SSH configuration cannot be parsed.
     pub fn parse(&self, reader: &mut impl BufRead) -> Result<Vec<Host>, ParseError> {
-        let (global_host, mut hosts) = self.parse_raw(reader)?;
+        self.parse_with_base(reader, &shellexpand::tilde("~/.ssh"))
+    }
+
+    fn parse_with_base(
+        &self,
+        reader: &mut impl BufRead,
+        include_base: &str,
+    ) -> Result<Vec<Host>, ParseError> {
+        let (global_host, mut hosts) = self.parse_raw(reader, 0, include_base)?;
 
         if !global_host.is_empty() {
             for host in &mut hosts {
@@ -57,20 +75,26 @@ impl Parser {
         Ok(hosts)
     }
 
-    fn parse_raw(&self, reader: &mut impl BufRead) -> Result<(Host, Vec<Host>), ParseError> {
+    fn parse_raw(
+        &self,
+        reader: &mut impl BufRead,
+        depth: usize,
+        include_base: &str,
+    ) -> Result<(Host, Vec<Host>), ParseError> {
         let mut parent_host = Host::new(Vec::new());
         let mut hosts = Vec::new();
+        let mut in_match_block = false;
 
-        let mut line = String::new();
-        while reader.read_line(&mut line)? > 0 {
-            // We separate parts that contain comments with #
-            line = line.split('#').next().unwrap().trim().to_string();
+        let mut buf = String::new();
+        while reader.read_line(&mut buf)? > 0 {
+            let line = strip_comment(&buf).trim().to_string();
+            buf.clear();
+
             if line.is_empty() {
                 continue;
             }
 
             let entry = parse_line(&line)?;
-            line.clear();
 
             match entry.0 {
                 EntryType::Unknown(_) => {
@@ -83,17 +107,34 @@ impl Parser {
                     }
                 }
                 EntryType::Host => {
+                    in_match_block = false;
+
                     let patterns = parse_patterns(&entry.1);
                     hosts.push(Host::new(patterns));
 
                     continue;
                 }
+                EntryType::Match => {
+                    in_match_block = true;
+                    continue;
+                }
                 EntryType::Include => {
+                    if in_match_block {
+                        continue;
+                    }
+
+                    if depth >= MAX_INCLUDE_DEPTH {
+                        return Err(InvalidIncludeError {
+                            line,
+                            details: InvalidIncludeErrorDetails::MaxDepthExceeded,
+                        }
+                        .into());
+                    }
+
                     let mut include_path = shellexpand::tilde(&entry.1).to_string();
 
                     if !include_path.starts_with('/') {
-                        let ssh_config_directory = shellexpand::tilde("~/.ssh").to_string();
-                        include_path = format!("{ssh_config_directory}/{include_path}");
+                        include_path = format!("{include_base}/{include_path}");
                     }
 
                     let paths = match glob(&include_path) {
@@ -120,7 +161,8 @@ impl Parser {
                         };
 
                         let mut file = BufReader::new(File::open(path)?);
-                        let (included_parent_host, included_hosts) = self.parse_raw(&mut file)?;
+                        let (included_parent_host, included_hosts) =
+                            self.parse_raw(&mut file, depth + 1, include_base)?;
 
                         if hosts.is_empty() {
                             parent_host.extend_entries(&included_parent_host);
@@ -139,6 +181,10 @@ impl Parser {
                 _ => {}
             }
 
+            if in_match_block {
+                continue;
+            }
+
             if hosts.is_empty() {
                 parent_host.update(entry);
             } else {
@@ -148,6 +194,22 @@ impl Parser {
 
         Ok((parent_host, hosts))
     }
+}
+
+/// Strips a trailing comment, keeping any `#` inside double quotes,
+/// matching OpenSSH's tokenizer.
+fn strip_comment(line: &str) -> &str {
+    let mut in_double_quotes = false;
+
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => in_double_quotes = !in_double_quotes,
+            '#' if !in_double_quotes => return &line[..i],
+            _ => {}
+        }
+    }
+
+    line
 }
 
 fn parse_line(line: &str) -> Result<Entry, ParseError> {
@@ -248,7 +310,10 @@ mod tests {
     #[test]
     fn test_include_file_parsing() {
         let included_path = testdata("include/included.conf");
-        let config = format!("Include {}\nHost main\n  Port 22\n", included_path.display());
+        let config = format!(
+            "Include {}\nHost main\n  Port 22\n",
+            included_path.display()
+        );
 
         let mut reader = std::io::BufReader::new(config.as_bytes());
         let parser = Parser::new();
@@ -271,7 +336,15 @@ mod tests {
 
         let result = parser.parse_file(testdata("unknown_entry.conf"));
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ParseError::UnknownEntry(_)));
+        match result.unwrap_err() {
+            ParseError::UnknownEntry(err) => {
+                assert!(
+                    !err.line.is_empty(),
+                    "error should carry the offending line"
+                );
+            }
+            other => panic!("expected UnknownEntry error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -301,6 +374,53 @@ mod tests {
             result.unwrap_err(),
             ParseError::UnparseableLine(_)
         ));
+    }
+
+    #[test]
+    fn test_match_block_entries_do_not_leak_into_previous_host() {
+        let parser = Parser::new();
+        let result = parser.parse_file(testdata("match_block.conf")).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].get(&EntryType::User).unwrap(), "serveruser");
+        assert_eq!(result[0].get(&EntryType::Port), None);
+        assert_eq!(result[1].get(&EntryType::User), None);
+        assert_eq!(result[1].get(&EntryType::Port), None);
+    }
+
+    #[test]
+    fn test_self_including_file_errors_instead_of_overflowing() {
+        let path = std::env::temp_dir().join("sshs_test_self_include.conf");
+        std::fs::write(&path, format!("Include {}\nHost a\n", path.display())).unwrap();
+
+        let parser = Parser::new();
+        let result = parser.parse_file(&path);
+        std::fs::remove_file(&path).ok();
+
+        match result.unwrap_err() {
+            ParseError::InvalidInclude(err) => {
+                assert!(matches!(
+                    err.details,
+                    InvalidIncludeErrorDetails::MaxDepthExceeded
+                ));
+            }
+            other => panic!("expected InvalidInclude error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_hash_inside_quoted_value_is_kept() {
+        let config = "Host test\n  ProxyCommand \"connect # not a comment\" # real comment\n";
+        let mut reader = std::io::BufReader::new(config.as_bytes());
+
+        let parser = Parser::new();
+        let result = parser.parse(&mut reader).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].get(&EntryType::ProxyCommand).unwrap(),
+            "connect # not a comment"
+        );
     }
 
     #[test]

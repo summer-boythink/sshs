@@ -33,11 +33,19 @@ struct Args {
     #[arg(short, long)]
     search: Option<String>,
 
-    /// Sort hosts by hostname
+    /// Color of the interface (a Tailwind palette name, for example blue, green, rose)
+    #[arg(long, default_value = "blue")]
+    color: String,
+
+    /// Sort hosts by hostname (default)
     #[arg(long, default_value_t = true)]
     sort: bool,
 
-    /// Fancy Levenshtein sort by edit distance
+    /// Do not sort hosts, keep the configuration file order
+    #[arg(long, default_value_t = false)]
+    no_sort: bool,
+
+    /// Sort search results by fuzzy match score, best match first
     #[arg(long, default_value_t = false)]
     sort_fancy: bool,
 
@@ -64,8 +72,9 @@ fn main() -> Result<()> {
     let mut app = App::new(&AppConfig {
         config_paths: args.config,
         search_filter: args.search,
-        sort_by_name: args.sort,
-        sort_by_levenshtein: args.sort_fancy,
+        color: args.color,
+        sort_by_name: args.sort && !args.no_sort,
+        sort_by_score: args.sort_fancy,
         show_proxy_command: args.show_proxy_command,
         command_template: args.template,
         command_template_on_session_start: args.on_session_start_template,

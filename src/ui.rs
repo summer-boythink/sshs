@@ -8,7 +8,6 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 #[allow(clippy::wildcard_imports)]
 use ratatui::{prelude::*, widgets::*};
 use std::{
@@ -24,7 +23,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{searchable::Searchable, ssh};
 
-const INFO_TEXT: &str = "(Esc) quit | (↑/↓/click) navigate | (enter) connect";
+const INFO_TEXT: &str = "(Esc) quit | (↑/↓/click) navigate | (enter) select | (ctrl+r) reload";
 
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -32,8 +31,9 @@ pub struct AppConfig {
     pub config_paths: Vec<String>,
 
     pub search_filter: Option<String>,
+    pub color: String,
     pub sort_by_name: bool,
-    pub sort_by_levenshtein: bool,
+    pub sort_by_score: bool,
     pub show_proxy_command: bool,
 
     pub command_template: String,
@@ -50,6 +50,7 @@ pub struct App {
     table_state: TableState,
     hosts: Searchable<ssh::Host>,
     table_columns_constraints: Vec<Constraint>,
+    page_step: usize,
 
     palette: tailwind::Palette,
     table_area: Rect,
@@ -69,38 +70,9 @@ impl App {
     ///
     /// Will return `Err` if the SSH configuration file cannot be parsed.
     pub fn new(config: &AppConfig) -> Result<App> {
-        let mut hosts = Vec::new();
-
-        for path in &config.config_paths {
-            let parsed_hosts = match ssh::parse_config(path) {
-                Ok(hosts) => hosts,
-                Err(err) => {
-                    if let ssh::ParseConfigError::Io(io_err) = &err {
-                        if io_err.kind() == std::io::ErrorKind::NotFound {
-                            if path == "/etc/ssh/ssh_config" {
-                                // Ignore missing system-wide SSH configuration file
-                                continue;
-                            }
-
-                            anyhow::bail!(
-                                "SSH configuration file not found: {path}\nCreate it, or pass a different path with -c/--config."
-                            );
-                        }
-                    }
-
-                    anyhow::bail!("Failed to parse SSH configuration file: {err:?}");
-                }
-            };
-
-            hosts.extend(parsed_hosts);
-        }
-
-        if config.sort_by_name {
-            hosts.sort_by_key(|host| host.name.to_lowercase());
-        }
+        let hosts = load_hosts(config)?;
 
         let search_input = config.search_filter.clone().unwrap_or_default();
-        let matcher = SkimMatcherV2::default();
 
         let mut app = App {
             config: config.clone(),
@@ -109,24 +81,13 @@ impl App {
 
             table_state: TableState::default().with_selected(0),
             table_columns_constraints: Vec::new(),
-            palette: tailwind::BLUE,
+            page_step: 21,
+            palette: palette_by_name(&config.color)?,
             table_area: Rect::default(),
             table_header_height: 0,
             table_top_border: 0,
 
-            hosts: Searchable::new(
-                config.sort_by_levenshtein,
-                hosts,
-                &search_input,
-                move |host: &&ssh::Host, search_value: &str| -> bool {
-                    search_value.is_empty()
-                        || matcher.fuzzy_match(&host.name, search_value).is_some()
-                        || matcher
-                            .fuzzy_match(&host.destination, search_value)
-                            .is_some()
-                        || matcher.fuzzy_match(&host.aliases, search_value).is_some()
-                },
-            ),
+            hosts: Searchable::new(config.sort_by_score, hosts, &search_input),
         };
         app.calculate_table_columns_constraints();
 
@@ -193,6 +154,11 @@ impl App {
         Ok(())
     }
 
+    /// Handles left-clicks on the host table to select a row.
+    ///
+    /// NOTE: click selection requires mouse capture (see `setup_terminal`).
+    /// In most terminals, hold `Shift` while dragging to select/copy text,
+    /// since the application now receives mouse events.
     fn on_mouse_event<B>(
         &mut self,
         _terminal: &Rc<RefCell<Terminal<B>>>,
@@ -202,27 +168,40 @@ impl App {
         B: Backend + std::io::Write,
         <B as Backend>::Error: Send + Sync + 'static,
     {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            // Check if click is within table area
-            let table_area = self.table_area;
-            if mouse.column >= table_area.x
-                && mouse.column < table_area.x + table_area.width
-                && mouse.row >= table_area.y
-                && mouse.row < table_area.y + table_area.height
-            {
-                // Calculate which row was clicked
-                let header_height = self.table_header_height;
-                let top_border = self.table_top_border;
-                let row_offset = table_area.y + top_border + header_height;
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Ok(AppKeyAction::Ok);
+        }
 
-                if mouse.row >= row_offset {
-                    let scroll_offset = self.table_state.offset();
-                    let clicked_row = usize::from(mouse.row - row_offset) + scroll_offset;
-                    if clicked_row < self.hosts.len() {
-                        self.table_state.select(Some(clicked_row));
-                    }
-                }
-            }
+        // Nothing to select or nowhere to click yet (first frame).
+        let table_area = self.table_area;
+        if self.hosts.is_empty() || table_area.width == 0 || table_area.height == 0 {
+            return Ok(AppKeyAction::Ok);
+        }
+
+        let right = table_area.x.saturating_add(table_area.width);
+        let bottom = table_area.y.saturating_add(table_area.height);
+        if mouse.column < table_area.x
+            || mouse.column >= right
+            || mouse.row < table_area.y
+            || mouse.row >= bottom
+        {
+            return Ok(AppKeyAction::Ok);
+        }
+
+        // First data row sits below the top border + header.
+        let row_offset = table_area
+            .y
+            .saturating_add(self.table_top_border)
+            .saturating_add(self.table_header_height);
+        if mouse.row < row_offset {
+            // Clicked on border/header, ignore.
+            return Ok(AppKeyAction::Ok);
+        }
+
+        let visible_index = usize::from(mouse.row.saturating_sub(row_offset));
+        let clicked_row = visible_index.saturating_add(self.table_state.offset());
+        if clicked_row < self.hosts.len() {
+            self.table_state.select(Some(clicked_row));
         }
 
         Ok(AppKeyAction::Ok)
@@ -259,13 +238,16 @@ impl App {
                 .select(Some(self.hosts.len().saturating_sub(1))),
             PageDown => {
                 let i = self.table_state.selected().unwrap_or(0);
-                let target = min(i.saturating_add(21), self.hosts.len().saturating_sub(1));
+                let target = min(
+                    i.saturating_add(self.page_step),
+                    self.hosts.len().saturating_sub(1),
+                );
 
                 self.table_state.select(Some(target));
             }
             PageUp => {
                 let i = self.table_state.selected().unwrap_or(0);
-                let target = max(i.saturating_sub(21), 0);
+                let target = max(i.saturating_sub(self.page_step), 0);
 
                 self.table_state.select(Some(target));
             }
@@ -280,13 +262,13 @@ impl App {
                 restore_terminal(terminal).expect("Failed to restore terminal");
 
                 if let Some(template) = &self.config.command_template_on_session_start {
-                    host.run_command_template(template)?;
+                    host.spawn_command_template(template)?;
                 }
 
-                host.run_command_template(&self.config.command_template)?;
+                host.spawn_command_template(&self.config.command_template)?;
 
                 if let Some(template) = &self.config.command_template_on_session_end {
-                    host.run_command_template(template)?;
+                    host.spawn_command_template(template)?;
                 }
 
                 setup_terminal(terminal).expect("Failed to setup terminal");
@@ -315,6 +297,10 @@ impl App {
                 self.previous();
                 AppKeyAction::Ok
             }
+            Char('r') => {
+                self.reload_hosts();
+                AppKeyAction::Ok
+            }
             _ => AppKeyAction::Continue,
         }
     }
@@ -341,6 +327,16 @@ impl App {
         } else {
             self.hosts.search(self.search.value());
             self.table_state.select(Some(0));
+        }
+    }
+
+    /// Re-reads the configuration files. Keeps the current list when a file
+    /// no longer parses.
+    fn reload_hosts(&mut self) {
+        if let Ok(hosts) = load_hosts(&self.config) {
+            self.hosts = Searchable::new(self.config.sort_by_score, hosts, self.search.value());
+            self.table_state.select(Some(0));
+            self.calculate_table_columns_constraints();
         }
     }
 
@@ -379,7 +375,7 @@ impl App {
 
         let name_len = self
             .hosts
-            .iter()
+            .non_filtered_iter()
             .map(|d| d.name.as_str())
             .map(UnicodeWidthStr::width)
             .max()
@@ -452,7 +448,75 @@ impl App {
                 .skip(1)
                 .map(|len| Constraint::Min(u16::try_from(*len).unwrap_or_default() + 1)),
         );
+
+        self.table_columns_constraints = new_constraints;
     }
+}
+
+fn load_hosts(config: &AppConfig) -> Result<Vec<ssh::Host>> {
+    let mut hosts = Vec::new();
+
+    for path in &config.config_paths {
+        let parsed_hosts = match ssh::parse_config(path) {
+            Ok(hosts) => hosts,
+            Err(err) => {
+                if let ssh::ParseConfigError::Io(io_err) = &err {
+                    if io_err.kind() == std::io::ErrorKind::NotFound {
+                        if path == "/etc/ssh/ssh_config" {
+                            // Ignore missing system-wide SSH configuration file
+                            continue;
+                        }
+
+                        anyhow::bail!(
+                            "SSH configuration file not found: {path}\nCreate it, or pass a different path with -c/--config."
+                        );
+                    }
+                }
+
+                anyhow::bail!("Failed to parse SSH configuration file: {err:?}");
+            }
+        };
+
+        hosts.extend(parsed_hosts);
+    }
+
+    if config.sort_by_name {
+        hosts.sort_by_key(|host| host.name.to_lowercase());
+    }
+
+    Ok(hosts)
+}
+
+fn palette_by_name(name: &str) -> Result<tailwind::Palette> {
+    let palette = match name.to_lowercase().as_str() {
+        "slate" => tailwind::SLATE,
+        "gray" => tailwind::GRAY,
+        "zinc" => tailwind::ZINC,
+        "neutral" => tailwind::NEUTRAL,
+        "stone" => tailwind::STONE,
+        "red" => tailwind::RED,
+        "orange" => tailwind::ORANGE,
+        "amber" => tailwind::AMBER,
+        "yellow" => tailwind::YELLOW,
+        "lime" => tailwind::LIME,
+        "green" => tailwind::GREEN,
+        "emerald" => tailwind::EMERALD,
+        "teal" => tailwind::TEAL,
+        "cyan" => tailwind::CYAN,
+        "sky" => tailwind::SKY,
+        "blue" => tailwind::BLUE,
+        "indigo" => tailwind::INDIGO,
+        "violet" => tailwind::VIOLET,
+        "purple" => tailwind::PURPLE,
+        "fuchsia" => tailwind::FUCHSIA,
+        "pink" => tailwind::PINK,
+        "rose" => tailwind::ROSE,
+        _ => anyhow::bail!(
+            "Unknown color: {name}\nValid colors: slate, gray, zinc, neutral, stone, red, orange, amber, yellow, lime, green, emerald, teal, cyan, sky, blue, indigo, violet, purple, fuchsia, pink, rose"
+        ),
+    };
+
+    Ok(palette)
 }
 
 fn setup_terminal<B>(terminal: &Rc<RefCell<Terminal<B>>>) -> Result<()>
@@ -527,7 +591,9 @@ fn render_searchbar(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
-    // Store the table area for mouse click detection
+    // The visible row count: the area minus the two border lines and the header.
+    app.page_step = max(usize::from(area.height.saturating_sub(3)), 1);
+    // Store the table area for mouse click detection.
     app.table_area = area;
 
     let header_style = Style::default().fg(tailwind::CYAN.c500);
@@ -610,8 +676,9 @@ mod tests {
                 .to_string_lossy()
                 .into_owned()],
             search_filter: None,
+            color: "blue".to_string(),
             sort_by_name: false,
-            sort_by_levenshtein: false,
+            sort_by_score: false,
             show_proxy_command: false,
             command_template: r#"ssh "{{{name}}}""#.to_string(),
             command_template_on_session_start: None,
@@ -623,6 +690,40 @@ mod tests {
     fn type_char(app: &mut App, c: char) {
         let ev = Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         app.handle_search_event(&ev);
+    }
+
+    #[test]
+    fn test_reload_hosts_picks_up_file_changes() {
+        let path = std::env::temp_dir().join("sshs_test_reload.conf");
+        std::fs::write(&path, "Host first\n  Hostname first.example.com\n").unwrap();
+
+        let mut config = test_config();
+        config.config_paths = vec![path.to_string_lossy().into_owned()];
+
+        let mut app = App::new(&config).unwrap();
+        assert_eq!(app.hosts.len(), 1);
+
+        std::fs::write(
+            &path,
+            "Host first\n  Hostname first.example.com\nHost second\n  Hostname second.example.com\n",
+        )
+        .unwrap();
+        app.reload_hosts();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(app.hosts.len(), 2);
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn test_table_columns_constraints_are_computed() {
+        let app = App::new(&test_config()).unwrap();
+
+        assert_eq!(app.table_columns_constraints.len(), 5);
+        assert!(matches!(
+            app.table_columns_constraints[0],
+            Constraint::Length(len) if len > 1
+        ));
     }
 
     /// Regression test for <https://github.com/quantumsheep/sshs/issues/120>:

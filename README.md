@@ -10,7 +10,7 @@ It uses `~/.ssh/config` to list and connect to hosts.
 <br>
 <br>
 
-[![example](https://i.imgur.com/vdve7d5.gif)](https://asciinema.org/a/642202)
+![example](.github/demo/demo.gif)
 
 ## Requirements
 
@@ -44,6 +44,15 @@ pacman -S sshs
 
 ```shell
 apk add sshs
+```
+
+### Debian / Ubuntu
+
+Download the `.deb` file for your architecture, then install it. Replace `amd64` with `arm64` on ARM machines.
+
+```shell
+curl -LO https://github.com/quantumsheep/sshs/releases/latest/download/sshs-linux-amd64.deb
+sudo apt install ./sshs-linux-amd64.deb
 ```
 
 ### NetBSD

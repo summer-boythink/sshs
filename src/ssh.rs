@@ -19,8 +19,8 @@ pub struct Host {
 }
 
 impl SearchableItem for Host {
-    fn search_text(&self) -> &str {
-        &self.name
+    fn search_texts(&self) -> Vec<&str> {
+        vec![&self.name, &self.aliases, &self.destination]
     }
 }
 
@@ -56,20 +56,31 @@ impl Host {
 
         Ok(Command::new(command).args(args).spawn()?.wait()?)
     }
+}
 
-    /// Uses the provided Handlebars template to run a command.
-    ///
-    /// # Errors
-    ///
-    /// Will return `Err` if the command cannot be executed.
-    pub fn run_command_template(&self, pattern: &str) -> anyhow::Result<()> {
-        let status = self.spawn_command_template(pattern)?;
-        if !status.success() {
-            std::process::exit(status.code().unwrap_or(1));
+/// Expands the `%h` and `%n` tokens that `ssh_config` allows in `HostName`,
+/// both standing for the host name given on the command line.
+fn expand_hostname_tokens(hostname: &str, name: &str) -> String {
+    let mut expanded = String::with_capacity(hostname.len());
+    let mut chars = hostname.chars();
+
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            expanded.push(c);
+            continue;
         }
 
-        Ok(())
+        match chars.next() {
+            Some('h' | 'n') => expanded.push_str(name),
+            Some('%') | None => expanded.push('%'),
+            Some(other) => {
+                expanded.push('%');
+                expanded.push(other);
+            }
+        }
     }
+
+    expanded
 }
 
 #[derive(Debug)]
@@ -103,19 +114,21 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
         .apply_name_to_empty_hostname()
         .merge_same_hosts()
         .iter()
-        .map(|host| Host {
-            name: host
-                .get_patterns()
-                .first()
-                .unwrap_or(&String::new())
-                .clone(),
-            aliases: host.get_patterns().iter().skip(1).join(", "),
-            user: host.get(&ssh_config::EntryType::User),
-            destination: host
+        .map(|host| {
+            let name = host.get_patterns().first().cloned().unwrap_or_default();
+            let destination = host
                 .get(&ssh_config::EntryType::Hostname)
-                .unwrap_or_default(),
-            port: host.get(&ssh_config::EntryType::Port),
-            proxy_command: host.get(&ssh_config::EntryType::ProxyCommand),
+                .unwrap_or_default();
+            let destination = expand_hostname_tokens(&destination, &name);
+
+            Host {
+                aliases: host.get_patterns().iter().skip(1).join(", "),
+                user: host.get(&ssh_config::EntryType::User),
+                port: host.get(&ssh_config::EntryType::Port),
+                proxy_command: host.get(&ssh_config::EntryType::ProxyCommand),
+                name,
+                destination,
+            }
         })
         .collect();
 
@@ -203,6 +216,19 @@ mod tests {
     }
 
     #[test]
+    fn test_hostname_tokens_expand_to_host_name() {
+        let hosts = load("token_hostname.conf");
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].destination, "server1.example.com");
+        assert_eq!(
+            hosts[0]
+                .render_command_template(r#"ssh "{{{destination}}}""#)
+                .unwrap(),
+            r#"ssh "server1.example.com""#
+        );
+    }
+
+    #[test]
     fn test_render_custom_template_fields() {
         let hosts = load("basic.conf");
         assert_eq!(hosts.len(), 1);
@@ -249,6 +275,7 @@ mod integration_tests {
     }
 
     #[test]
+    #[ignore = "needs the Docker SSH server from docker-compose.yml"]
     fn test_run_command_template_docker() {
         let hosts = parse_config(&testdata("docker.conf")).unwrap();
         assert_eq!(hosts.len(), 1);
@@ -265,6 +292,7 @@ mod integration_tests {
     }
 
     #[test]
+    #[ignore = "needs the Docker SSH server from docker-compose.yml"]
     fn test_run_command_template_spaces_in_name() {
         let hosts = parse_config(&testdata("spaces_docker.conf")).unwrap();
         assert_eq!(hosts.len(), 1);

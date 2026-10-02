@@ -1,6 +1,6 @@
 [package]
 name = "sshs"
-version = "4.7.2"
+version = "4.8.0"
 edition = "2021"
 description = "Terminal user interface for SSH"
 license = "MIT"
@@ -10,10 +10,17 @@ authors = ["Nathanael Demacon"]
 name = "sshs"
 path = "src/main.rs"
 
+[[example]]
+name = "demo"
+path = "scripts/demo.rs"
+
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
+
+[package.metadata.deb]
+depends = "$auto, openssh-client"
 
 [dependencies]
 anyhow = "1.0.98"
